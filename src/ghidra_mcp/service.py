@@ -1,6 +1,7 @@
 """完整 MCP 服务对象的装配与退出清理。"""
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -52,8 +53,15 @@ def create_service(settings: Settings, *, pyghidra_module: Any | None = None) ->
         project_location=settings.storage_root,
         input_root=settings.input_root,
     )
+    def resource_namer(arguments: dict[str, Any]) -> str | None:
+        if "program_id" in arguments:
+            return workspace.resource_key(str(arguments["program_id"]))
+        if "binary_path" in arguments:
+            return str(Path(str(arguments["binary_path"])).resolve())
+        return None
+
     registry = build_default_registry(workspace)
-    tool_executor = GhidraToolExecutor()
+    tool_executor = GhidraToolExecutor(max_workers=settings.max_workers)
     app = create_mcp_app(
         registry,
         host=settings.host,
@@ -61,6 +69,7 @@ def create_service(settings: Settings, *, pyghidra_module: Any | None = None) ->
         auth_token=settings.auth_token if settings.transport == "streamable-http" else None,
         public_url=public_url,
         tool_executor=tool_executor,
+        resource_namer=resource_namer,
     )
     return MCPService(
         settings=settings,
