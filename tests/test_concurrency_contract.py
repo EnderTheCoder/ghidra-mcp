@@ -43,47 +43,31 @@ def test_program_gates_share_readers_and_serialize_the_writer() -> None:
     from ghidra_mcp.concurrency import ProgramGates
 
     gates = ProgramGates()
-    entered = 0
-    entered_lock = threading.Lock()
-    readers_inside = threading.Event()
-    proceed = threading.Event()
-    order: list[str] = []
 
-    def reader(tag: str) -> None:
-        nonlocal entered
-        with gates.shared("p"):
-            with entered_lock:
-                entered += 1
-                if entered == 2:
-                    readers_inside.set()
-            order.append(f"read-{tag}-in")
-            proceed.wait(timeout=5)
-            order.append(f"read-{tag}-out")
+    async def exercise() -> list[str]:
+        order: list[str] = []
+        await gates.acquire("p", exclusive=False)
+        await gates.acquire("p", exclusive=False)
+        order.append("two-readers-in")
 
-    readers = [threading.Thread(target=reader, args=(str(i),)) for i in range(2)]
-    for reader_thread in readers:
-        reader_thread.start()
-    assert readers_inside.wait(timeout=5) is True
-
-    writer_entered = threading.Event()
-
-    def writer() -> None:
-        with gates.exclusive("p"):
-            writer_entered.set()
+        async def writer() -> None:
+            await gates.acquire("p", exclusive=True)
             order.append("write")
+            gates.release("p", exclusive=True)
 
-    writer_thread = threading.Thread(target=writer)
-    writer_thread.start()
-    assert writer_entered.wait(timeout=0.2) is False
+        task = asyncio.create_task(writer())
+        await asyncio.sleep(0)
+        assert not task.done()
+        gates.release("p", exclusive=False)
+        await asyncio.sleep(0)
+        assert not task.done()
+        order.append("reader-out")
+        gates.release("p", exclusive=False)
+        await task
+        return order
 
-    proceed.set()
-    for reader_thread in readers:
-        reader_thread.join(timeout=5)
-    writer_thread.join(timeout=5)
-
-    assert writer_entered.is_set()
-    assert order.index("write") > order.index("read-0-out")
-    assert order.index("write") > order.index("read-1-out")
+    assert asyncio.run(exercise()) == ["two-readers-in", "reader-out", "write"]
+    assert gates.active_keys() == []
 
 
 def test_executor_runs_shared_tools_concurrently() -> None:
@@ -141,9 +125,7 @@ def test_executor_runs_mutations_on_distinct_programs_in_parallel() -> None:
     tool = app._tool_manager._tools["exclusive"]
 
     async def exercise() -> None:
-        await asyncio.gather(
-            *(tool.run({"program_id": f"p{index}"}) for index in range(4))
-        )
+        await asyncio.gather(*(tool.run({"program_id": f"p{index}"}) for index in range(4)))
 
     try:
         asyncio.run(exercise())
@@ -177,12 +159,13 @@ def test_one_worker_executor_keeps_a_single_thread() -> None:
     assert len(set(worker_threads)) == 1
 
 
-def test_default_resource_namer_keys_program_and_binary_calls() -> None:
-    from ghidra_mcp.server import _default_resource_namer
+def test_program_resource_key_uses_one_key_space_for_programs_and_binaries() -> None:
+    from ghidra_mcp.concurrency import program_resource_key
 
-    assert _default_resource_namer({"program_id": "abc"}) == "program:abc"
-    assert _default_resource_namer({"text": "x"}) is None
-    assert (
-        _default_resource_namer({"binary_path": "data/sample.bin"})
-        == f"binary:{(Path('data/sample.bin')).resolve()}"
-    )
+    binary = str(Path("data/sample.bin").resolve())
+    assert program_resource_key({"program_id": "abc"}) == "abc"
+    assert program_resource_key({"text": "x"}) is None
+    assert program_resource_key({"binary_path": "data/sample.bin"}) == binary
+    assert program_resource_key(
+        {"program_id": "abc"}, resolve_program=lambda _: binary
+    ) == program_resource_key({"binary_path": "data/sample.bin"})

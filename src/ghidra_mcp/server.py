@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial, wraps
 from hashlib import sha256
 import hmac
@@ -13,7 +13,8 @@ import json
 import os
 from pathlib import Path
 import subprocess
-from typing import Any
+from threading import Condition
+from typing import Any, Callable
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.auth.provider import AccessToken, TokenVerifier
@@ -21,22 +22,21 @@ from mcp.server.auth.settings import AuthSettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-from .concurrency import ProgramGates
+from .concurrency import ProgramGates, program_resource_key
 from .registry import ToolDefinition, ToolRegistry
 
 
-def _default_resource_namer(arguments: dict[str, Any]) -> str | None:
-    """按 program_id 或 binary_path 推导程序资源键；非程序工具返回 None。"""
-
-    if "program_id" in arguments:
-        return f"program:{arguments['program_id']}"
-    if "binary_path" in arguments:
-        return f"binary:{Path(arguments['binary_path']).resolve()}"
-    return None
+class ExecutorClosedError(RuntimeError):
+    """执行器正在关闭或已经关闭，不再接受新的工具调用。"""
 
 
 class GhidraToolExecutor:
-    """在固定 worker 池上运行 JVM 工具，并按程序串行写、并行读。"""
+    """在固定 worker 池上运行 JVM 工具，并按程序串行写、并行读。
+
+    调用先在事件循环上拿到程序闸门，再占用 worker 线程；闸门在 worker 上的调用
+    真正结束时才释放。max_workers=1 时唯一的 worker 本身已经串行化所有调用，
+    闸门不会增加安全性，因此直接按提交顺序排队，与单线程执行器的顺序完全一致。
+    """
 
     def __init__(self, max_workers: int = 1, *, gates: ProgramGates | None = None) -> None:
         if max_workers < 1:
@@ -46,6 +46,9 @@ class GhidraToolExecutor:
         self._executor = ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="ghidra-mcp"
         )
+        self._state = Condition()
+        self._in_flight = 0
+        self._closing = False
 
     async def run(
         self,
@@ -56,28 +59,62 @@ class GhidraToolExecutor:
         resource: str | None = None,
         exclusive: bool = False,
     ) -> Any:
-        loop = asyncio.get_running_loop()
         call = partial(function, *args, **kwargs)
-        if resource is None:
-            return await loop.run_in_executor(self._executor, call)
-        runner = partial(self._guarded, call, resource, exclusive)
-        return await loop.run_in_executor(self._executor, runner)
-
-    def _guarded(self, call: Any, resource: str, exclusive: bool) -> Any:
-        gate = self._gates.exclusive if exclusive else self._gates.shared
-        with gate(resource):
-            return call()
+        if resource is None or self.max_workers == 1:
+            return await asyncio.wrap_future(self._submit(call))
+        await self._gates.acquire(resource, exclusive=exclusive)
+        try:
+            future = self._submit(call)
+        except BaseException:
+            self._gates.release(resource, exclusive=exclusive)
+            raise
+        # 闸门跟随 worker 上的调用释放：asyncio 侧被取消时，仍在运行的调用继续持有闸门。
+        future.add_done_callback(lambda _: self._gates.release(resource, exclusive=exclusive))
+        return await asyncio.wrap_future(future)
 
     def run_sync(self, function: Any, *args: Any, **kwargs: Any) -> Any:
-        return self._executor.submit(function, *args, **kwargs).result()
+        return self._submit(partial(function, *args, **kwargs)).result()
+
+    def close(self, finalizer: Callable[[], Any] | None = None) -> Any:
+        """停止接收新调用，等待已提交的调用全部结束，再在 worker 上执行 finalizer。
+
+        用于退出清理：finalizer（例如关闭全部程序）不会与仍在运行的工具调用并发。
+        """
+
+        with self._state:
+            self._closing = True
+            self._state.wait_for(lambda: self._in_flight == 0)
+        try:
+            if finalizer is not None:
+                return self._executor.submit(finalizer).result()
+            return None
+        finally:
+            self._executor.shutdown(wait=True)
 
     def shutdown(self) -> None:
-        self._executor.shutdown(wait=True)
+        self.close()
+
+    def _submit(self, call: Callable[[], Any]) -> Future[Any]:
+        with self._state:
+            if self._closing:
+                raise ExecutorClosedError("服务正在关闭，不再接受新的工具调用")
+            self._in_flight += 1
+        try:
+            future = self._executor.submit(call)
+        except BaseException:
+            self._finish(None)
+            raise
+        future.add_done_callback(self._finish)
+        return future
+
+    def _finish(self, _future: Future[Any] | None) -> None:
+        with self._state:
+            self._in_flight -= 1
+            if self._in_flight == 0:
+                self._state.notify_all()
 
 
-def _async_handler(
-    tool: ToolDefinition, executor: GhidraToolExecutor, resource_namer: Any
-) -> Any:
+def _async_handler(tool: ToolDefinition, executor: GhidraToolExecutor, resource_namer: Any) -> Any:
     @wraps(tool.handler)
     async def wrapped(*args: Any, **kwargs: Any) -> Any:
         return await executor.run(
@@ -184,7 +221,7 @@ def create_mcp_app(
         token_verifier=verifier,
     )
     executor = tool_executor or GhidraToolExecutor(max_workers=max_workers)
-    namer = resource_namer or _default_resource_namer
+    namer = resource_namer or program_resource_key
     for tool in registry.enabled_tools():
         app.tool(
             name=tool.name,
