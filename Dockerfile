@@ -1,9 +1,3 @@
-# Explicitly installed Ubuntu packages are pinned to exact versions from
-# noble-updates/noble-security (resolved 2026-10-19 against the pinned base image).
-# The Ubuntu archive only indexes the newest version per pocket, so a pin stops
-# resolving once Ubuntu publishes an update: the build then fails loudly and the
-# pins must be refreshed (run `apt-get update && apt-cache policy <package>` in
-# the pinned base image) instead of silently picking up a different package.
 FROM ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90 AS ghidra
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -13,7 +7,7 @@ ARG GHIDRA_URL=https://github.com/NationalSecurityAgency/ghidra/releases/downloa
 ARG GHIDRA_SHA256=b62e81a0390618466c019c60d8c2f796ced2509c4c1aea4a37644a77272cf99d
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates=20260601~24.04.1 curl=8.5.0-2ubuntu10.16 unzip=6.0-28ubuntu4.1 \
+    && apt-get install -y --no-install-recommends ca-certificates curl unzip \
     && rm -rf /var/lib/apt/lists/*
 RUN curl -fsSL --continue-at - --retry 5 --retry-all-errors --retry-max-time 300 \
         "$GHIDRA_URL" -o /tmp/ghidra.zip \
@@ -29,7 +23,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 WORKDIR /src
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates=20260601~24.04.1 python3=3.12.3-0ubuntu2.1 python3-venv=3.12.3-0ubuntu2.1 \
+    && apt-get install -y --no-install-recommends ca-certificates python3 python3-venv \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -m venv /opt/build-venv
 ENV PATH=/opt/build-venv/bin:$PATH
@@ -56,8 +50,18 @@ ENV DEBIAN_FRONTEND=noninteractive \
     GHIDRA_MCP_INPUT_ROOT=/data/input \
     PATH=/opt/venv/bin:$PATH
 
+# Runtime apt pins: only the packages the server actually executes are pinned,
+# to exact versions resolved from noble-updates/noble-security for the base image
+# digest above. python3.12 pins python3.12-minimal and libpython3.12-stdlib through
+# its exact (=) dependencies; python3 and python3-venv are unversioned metapackages
+# that provide the python3 command and accept the pinned interpreter. Other runtime
+# libraries (for example OpenJDK's dependencies) are not pinned. The build stages
+# are not pinned because their downloads are verified separately (Ghidra by
+# sha256, Python wheels by the hashes in uv.lock). Ubuntu only indexes the newest
+# version per pocket, so a pin stops resolving when Ubuntu ships an update; the
+# scheduled .github/workflows/apt-pin-check.yml run turns red when that happens.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates=20260601~24.04.1 openjdk-21-jre-headless=21.0.12.1+1-1~24.04.4 python3=3.12.3-0ubuntu2.1 python3-venv=3.12.3-0ubuntu2.1 \
+    && apt-get install -y --no-install-recommends ca-certificates openjdk-21-jre-headless=21.0.12.1+1-1~24.04.4 python3 python3-venv python3.12=3.12.3-1ubuntu0.17 python3.12-venv=3.12.3-1ubuntu0.17 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 ghidra-mcp \
     && useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin ghidra-mcp \
