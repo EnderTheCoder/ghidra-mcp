@@ -44,6 +44,8 @@ class _Waiter:
     loop: asyncio.AbstractEventLoop
     future: asyncio.Future[None]
     granted: bool = False
+    # 事件循环已关闭、闸门已由 _notify 代为交还；等待者自身不得再释放一次。
+    abandoned: bool = False
 
 
 @dataclass(slots=True)
@@ -107,7 +109,11 @@ class ProgramGates:
             await waiter.future
         except BaseException:
             with self._guard:
+                if waiter.abandoned:
+                    raise
                 granted = waiter.granted
+                # 谁把 granted 置回 False，谁负责交还闸门（与 _notify 的失败分支互斥）。
+                waiter.granted = False
                 woken: list[_Waiter] = []
                 if not granted:
                     gate.waiters.remove(waiter)
@@ -158,5 +164,11 @@ class ProgramGates:
             try:
                 waiter.loop.call_soon_threadsafe(_resolve, waiter.future)
             except RuntimeError:
-                # 事件循环已经关闭，等待者永远不会运行：把闸门交还给后面的人。
-                self.release(key, exclusive=waiter.exclusive)
+                # 事件循环已经关闭，等待者永远不会运行：把闸门交还给后面的人，
+                # 并标记等待者，使它的协程被销毁时不会重复释放。
+                with self._guard:
+                    owned = waiter.granted
+                    waiter.granted = False
+                    waiter.abandoned = True
+                if owned:
+                    self.release(key, exclusive=waiter.exclusive)

@@ -527,3 +527,119 @@ def test_one_worker_keeps_the_single_thread_submission_order_across_programs() -
         "read-a",
         "write-b",
     ]
+
+
+@pytest.mark.parametrize("workers", [2, 4])
+@pytest.mark.parametrize("cancel_queued", [True, False])
+def test_shutdown_lets_a_running_write_finish_and_drops_calls_queued_behind_it(
+    workers: int, cancel_queued: bool
+) -> None:
+    """退出时仍在写程序的调用（例如分析）必须先结束，之后才关闭程序；排在它后面的调用不再执行。"""
+
+    executor = GhidraToolExecutor(max_workers=workers)
+    recorder = Recorder()
+    write_started = threading.Event()
+    release_write = threading.Event()
+    close_entered = threading.Event()
+
+    def transport() -> None:
+        loop = asyncio.new_event_loop()
+        try:
+            running = loop.create_task(
+                executor.run(
+                    _blocking(recorder, "analysis", write_started, release_write),
+                    (),
+                    {},
+                    resource="program-a",
+                    exclusive=True,
+                )
+            )
+            loop.run_until_complete(_wait_thread_event(write_started))
+            queued = [
+                loop.create_task(
+                    executor.run(
+                        _instant(recorder, tag), (), {}, resource="program-a", exclusive=exclusive
+                    )
+                )
+                for tag, exclusive in (("queued-read", False), ("queued-write", True))
+            ]
+            # 让排队的调用真正进入闸门队列。
+            loop.run_until_complete(asyncio.sleep(0.05))
+            assert not any(task.done() for task in queued)
+            running.cancel()
+            loop.run_until_complete(asyncio.gather(running, return_exceptions=True))
+            if cancel_queued:
+                for task in queued:
+                    task.cancel()
+                loop.run_until_complete(asyncio.gather(*queued, return_exceptions=True))
+            # cancel_queued=False 时排队的调用随事件循环一起被丢弃，从未被取消。
+        finally:
+            loop.close()
+
+    service = MCPService(
+        settings=Settings(),
+        app=_FakeApp(transport),  # type: ignore[arg-type]
+        workspace=_FakeWorkspace(recorder, close_entered),  # type: ignore[arg-type]
+        tool_executor=executor,
+    )
+    runner = threading.Thread(target=service.run)
+    runner.start()
+    try:
+        assert write_started.wait(DEADLINE)
+        # 写调用仍在 worker 上：关闭程序不能在此时开始。
+        assert close_entered.wait(QUIET_WINDOW) is False, recorder.events
+    finally:
+        release_write.set()
+        runner.join(DEADLINE)
+    assert not runner.is_alive()
+    assert recorder.events == ["analysis-start", "analysis-end", "close_all"]
+    assert executor._gates.active_keys() == []
+
+
+def test_waiter_abandoned_with_its_event_loop_does_not_release_the_gate_twice() -> None:
+    """等待者的事件循环关闭后，闸门由唤醒方代为交还；协程被销毁时不得再释放一次。"""
+
+    import gc
+    import sys
+
+    from ghidra_mcp.concurrency import ProgramGates
+
+    gates = ProgramGates()
+    unraisable: list[BaseException | None] = []
+    previous_hook = sys.unraisablehook
+    sys.unraisablehook = lambda record: unraisable.append(record.exc_value)
+    try:
+        abandoned_loop = asyncio.new_event_loop()
+        abandoned_loop.set_exception_handler(lambda _loop, _context: None)
+        try:
+            abandoned_loop.run_until_complete(gates.acquire("p", exclusive=False))
+            waiter = abandoned_loop.create_task(gates.acquire("p", exclusive=True))
+            abandoned_loop.run_until_complete(asyncio.sleep(0))
+            assert not waiter.done()
+        finally:
+            abandoned_loop.close()
+
+        # 读者结束：闸门交给已经无法运行的写等待者，再由唤醒方交还，键随之回收。
+        gates.release("p", exclusive=False)
+        assert gates.active_keys() == []
+
+        async def exercise() -> None:
+            await gates.acquire("p", exclusive=True)
+            # 销毁被遗弃的等待者协程：它不能释放当前持有者的独占闸门。
+            nonlocal waiter
+            del waiter
+            gc.collect()
+            second = asyncio.create_task(gates.acquire("p", exclusive=True))
+            for _ in range(5):
+                await asyncio.sleep(0)
+            assert not second.done(), "被遗弃的等待者重复释放了闸门，第二个写者被放行"
+            gates.release("p", exclusive=True)
+            await second
+            gates.release("p", exclusive=True)
+
+        asyncio.run(exercise())
+        gc.collect()
+    finally:
+        sys.unraisablehook = previous_hook
+    assert unraisable == []
+    assert gates.active_keys() == []
