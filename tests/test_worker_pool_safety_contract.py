@@ -596,6 +596,54 @@ def test_shutdown_lets_a_running_write_finish_and_drops_calls_queued_behind_it(
     assert executor._gates.active_keys() == []
 
 
+def test_one_worker_does_not_derive_resource_keys() -> None:
+    """单 worker 不用闸门，资源键推导不应运行，调用路径与单线程执行器一致。"""
+
+    from ghidra_mcp.registry import ToolDefinition, ToolRegistry
+    from ghidra_mcp.server import create_mcp_app
+
+    description = (
+        "资源键测试工具。\n\n输入输出与副作用：输入程序会话；返回程序会话；写入。\n\n"
+        "何时使用：仅用于验证单 worker 路径。\n"
+    )
+    namer_calls: list[dict[str, Any]] = []
+
+    def namer(arguments: dict[str, Any]) -> str | None:
+        namer_calls.append(arguments)
+        raise AssertionError("单 worker 不应推导资源键")
+
+    def probe(program_id: str) -> str:
+        return program_id
+
+    def build(workers: int):
+        registry = ToolRegistry()
+        registry.register(ToolDefinition("probe", description, probe, mutates=True))
+        executor = GhidraToolExecutor(max_workers=workers)
+        app = create_mcp_app(
+            registry,
+            host="127.0.0.1",
+            port=8765,
+            tool_executor=executor,
+            resource_namer=namer,
+        )
+        return app, executor
+
+    app, executor = build(1)
+    try:
+        asyncio.run(app.call_tool("probe", {"program_id": "p"}))
+    finally:
+        executor.shutdown()
+    assert namer_calls == []
+
+    app, executor = build(2)
+    try:
+        with pytest.raises(Exception, match="单 worker 不应推导资源键"):
+            asyncio.run(app.call_tool("probe", {"program_id": "p"}))
+    finally:
+        executor.shutdown()
+    assert namer_calls == [{"program_id": "p"}]
+
+
 def test_waiter_abandoned_with_its_event_loop_does_not_release_the_gate_twice() -> None:
     """等待者的事件循环关闭后，闸门由唤醒方代为交还；协程被销毁时不得再释放一次。"""
 

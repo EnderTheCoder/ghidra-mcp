@@ -117,11 +117,13 @@ class GhidraToolExecutor:
 def _async_handler(tool: ToolDefinition, executor: GhidraToolExecutor, resource_namer: Any) -> Any:
     @wraps(tool.handler)
     async def wrapped(*args: Any, **kwargs: Any) -> Any:
+        # 单 worker 不使用闸门，因此不在事件循环上推导资源键，保持与单线程执行器相同的调用路径。
+        resource = resource_namer(kwargs) if executor.max_workers > 1 else None
         return await executor.run(
             tool.handler,
             args,
             kwargs,
-            resource=resource_namer(kwargs),
+            resource=resource,
             exclusive=tool.mutates,
         )
 
