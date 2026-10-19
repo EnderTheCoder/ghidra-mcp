@@ -1,5 +1,18 @@
 # Changelog
 
+## 20261019.2
+
+- **Breaking change for self-hosted installations:** raised the minimum supported Ghidra version from 12.1.2 to 12.1.3. `ghidra-mcp` now refuses to start the JVM against Ghidra 12.1.2 or older and reports the detected version, the installation directory, the minimum version, and the reason. Ghidra 12.1.3 fixed a potential path-traversal vulnerability when importing XML `*.bytes` files (GP-7064) and an ELF importer regression introduced in 12.1.2 that could fail when processing the dynamic GNU hash table and symbol table (GP-7061). Upgrade Ghidra and point `GHIDRA_INSTALL_DIR` at the new installation before upgrading `ghidra-mcp`.
+- Upgraded the Ghidra bundled in the container image from 12.1.2 to the official 12.1.4 release (`ghidra_12.1.4_PUBLIC_20260921.zip`, SHA-256 `ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db`). Ghidra 12.1.4 also fixes a potential `DomainObjectLockedException` (GP-7190), potential stack overflows in the OMF and PE loaders (GP-7173, GP-7205), and stops loading libraries whose location a binary specifies with a UNC path (GP-7176).
+
+## 20261019.1
+
+- Security: upgraded `mcp` 1.28.1 → 1.30.0 to fix GHSA-84m7-p3x7-pcfv / CVE-2026-59951 (stateful Streamable HTTP sessions were never reclaimed, allowing unbounded memory growth), and raised the minimum supported `mcp` to 1.30.
+- Security: upgraded the transitive dependencies `pyjwt` 2.13.0 → 2.15.1 and `cryptography` 49.0.0 → 50.0.2 to clear published advisories.
+- Explicitly set `AuthSettings.validate_token_resource=False` for the static Bearer token verifier; behavior is unchanged and the new `mcp` deprecation warning is silenced.
+- Behavior change from the `mcp` 1.30 defaults in Streamable HTTP mode: request bodies larger than 4 MiB are rejected with HTTP 413, stateful sessions with no request in flight for 30 minutes are closed (an open GET stream keeps a session alive; requests to an expired session get HTTP 404 and the client must initialize again), and at most 10,000 sessions are kept at once (new sessions beyond that get HTTP 503). ghidra-mcp does not override these defaults.
+- Capped `requires-python` at `<3.14` because `pyghidra` 3.1.0 pins `JPype1==1.5.2`, which publishes no CPython 3.14 wheels; supported versions are Python 3.11–3.13, and `.python-version` pins local development to 3.12.
+
 ## 20260722.6
 
 - Moved detailed user documentation to the GitHub Wiki and made the remaining repository documentation English-first.

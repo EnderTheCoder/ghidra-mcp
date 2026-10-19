@@ -4,7 +4,7 @@
 
 A single-process MCP server for headless reverse engineering. One Python process starts the JVM through PyGhidra, manages persistent Ghidra projects, and exposes 35 task-oriented tools to AI clients.
 
-> The security baseline is Ghidra 12.1.2 or later. Streamable HTTP requires a Bearer token, and deployments beyond the local host must terminate TLS at a trusted reverse proxy.
+> The security baseline is Ghidra 12.1.3 or later; older installations are rejected before the JVM starts. The container image bundles Ghidra 12.1.4. Streamable HTTP requires a Bearer token, and deployments beyond the local host must terminate TLS at a trusted reverse proxy.
 
 ## Project status
 
@@ -14,7 +14,7 @@ This service is intended for controlled headless analysis, not as a multi-tenant
 
 ## Container image
 
-The repository contains a GitHub Actions workflow that builds `linux/amd64` with `--no-cache` after every push to `main`, publishes versioned and `latest` tags to GHCR, pulls the published digest, and verifies `/health` against the source version and commit.
+The repository contains a GitHub Actions workflow that builds `linux/amd64` with `--no-cache` when a release tag `v<VERSION>` (matching the root `VERSION` file) is pushed, publishes versioned and `latest` tags to GHCR, pulls the published digest, and verifies `/health` against the source version and commit.
 
 Once the GHCR package has been published and its visibility is set to public, pull it without authentication:
 
@@ -60,7 +60,7 @@ docker buildx build \
 
 ## Local stdio
 
-Requirements: Python 3.11+, Ghidra 12.1.2+, `uv`, and a writable project directory.
+Requirements: Python 3.11–3.13, Ghidra 12.1.3+, `uv`, and a writable project directory.
 
 ```bash
 uv sync --locked

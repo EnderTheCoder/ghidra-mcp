@@ -2,25 +2,36 @@ name: Publish container
 
 on:
   push:
-    branches: [main]
+    tags: ["v[0-9]*"]
 
 concurrency:
-  group: publish-container-${{ github.ref }}
+  group: publish-container
   cancel-in-progress: false
 
-permissions:
-  contents: read
-  packages: write
+# No workflow-level permissions: each job declares only what it needs.
+permissions: {}
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}
 
 jobs:
-  publish:
+  # Runs every gate and all third-party code (uv, dev dependencies, pytest)
+  # with a read-only token and no registry credentials.
+  test:
+    name: Gate and test release
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+      schema: ${{ steps.source.outputs.schema }}
     steps:
       - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Read and validate version
         id: version
@@ -28,14 +39,30 @@ jobs:
         run: |
           VERSION="$(tr -d '\r\n' < VERSION)"
           [[ "$VERSION" =~ ^[0-9]{8}\.[1-9][0-9]*$ ]]
+          if [[ "$GITHUB_REF_NAME" != "v$VERSION" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match VERSION file (expected v$VERSION)" >&2
+            exit 1
+          fi
           echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Require the tagged commit to be on main
+        shell: bash
+        run: |
+          if ! git rev-parse --verify --quiet "refs/remotes/origin/main^{commit}" >/dev/null; then
+            echo "origin/main is not available in the checkout; cannot verify the tag" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            echo "Tag $GITHUB_REF_NAME points to $GITHUB_SHA, which is not on main" >&2
+            exit 1
+          fi
 
       - name: Test source and prepare smoke fixture
         id: source
         shell: bash
         run: |
           python3 -m venv .ci-venv
-          .ci-venv/bin/pip install uv==0.8.0
+          .ci-venv/bin/pip install --require-hashes -r tools/uv-requirements.txt
           .ci-venv/bin/uv sync --locked --extra dev
           .ci-venv/bin/uv run pytest -m 'not integration'
           .ci-venv/bin/uv run ruff check .
@@ -44,6 +71,205 @@ jobs:
           echo "schema=$EXPECTED_SCHEMA" >> "$GITHUB_OUTPUT"
           mkdir .ci-fixtures
           cc -shared -fPIC -g -o .ci-fixtures/libsymbolic.so tests/fixtures/src/symbolic.c
+
+      - name: Build local test image
+        shell: bash
+        run: |
+          docker build --platform linux/amd64 \
+            --build-arg "GIT_COMMIT=${GITHUB_SHA}" \
+            --build-arg "VERSION=${{ steps.version.outputs.value }}" \
+            --tag ghidra-mcp-release-test:local .
+
+      - name: Run container MCP end-to-end test
+        shell: bash
+        run: |
+          TOKEN="$(openssl rand -hex 32)"
+          docker run -d --name ghidra-mcp-release-test --network host \
+            -e GHIDRA_MCP_PUBLIC_URL=http://127.0.0.1:8765 \
+            -e GHIDRA_MCP_AUTH_TOKEN="$TOKEN" \
+            -v "${GITHUB_WORKSPACE}/.ci-fixtures:/data/input:ro" \
+            ghidra-mcp-release-test:local
+          HEALTH=""
+          for _ in $(seq 1 30); do
+            HEALTH="$(curl -fsS http://127.0.0.1:8765/health || true)"
+            if [ -n "$HEALTH" ]; then
+              python3 -c 'import json,sys; data=json.loads(sys.argv[4]); assert data == {"status": "ok", "version": sys.argv[1], "git_commit": sys.argv[2], "schema_version": sys.argv[3]}' \
+                "${{ steps.version.outputs.value }}" "${{ github.sha }}" \
+                "${{ steps.source.outputs.schema }}" "$HEALTH"
+              break
+            fi
+            sleep 2
+          done
+          if [ -z "$HEALTH" ]; then
+            docker logs ghidra-mcp-release-test
+            exit 1
+          fi
+          GHIDRA_MCP_CONTAINER_URL=http://127.0.0.1:8765/mcp \
+            GHIDRA_MCP_CONTAINER_TOKEN="$TOKEN" \
+            .ci-venv/bin/uv run pytest tests/integration/test_container_mcp.py
+
+      - name: Remove test container
+        if: always()
+        run: docker rm -f ghidra-mcp-release-test 2>/dev/null || true
+
+  # Only this job can write packages. It runs no project or third-party Python
+  # code: only the pinned Docker actions, docker/curl and stdlib python3.
+  publish:
+    name: Publish image
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Re-read version and test outputs
+        id: version
+        shell: bash
+        env:
+          TESTED_VERSION: ${{ needs.test.outputs.version }}
+          TESTED_SCHEMA: ${{ needs.test.outputs.schema }}
+        run: |
+          VERSION="$(tr -d '\r\n' < VERSION)"
+          [[ "$VERSION" =~ ^[0-9]{8}\.[1-9][0-9]*$ ]]
+          if [[ "$GITHUB_REF_NAME" != "v$VERSION" || "$VERSION" != "$TESTED_VERSION" ]]; then
+            echo "VERSION $VERSION does not match tag $GITHUB_REF_NAME or tested version $TESTED_VERSION" >&2
+            exit 1
+          fi
+          [[ "$TESTED_SCHEMA" =~ ^[0-9a-f]{16}$ ]]
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "schema=$TESTED_SCHEMA" >> "$GITHUB_OUTPUT"
+
+      # Runs before registry login and before anything is built or pushed, so an
+      # outdated VERSION never produces a sha- candidate tag. It stays in this job
+      # (not in `test`) so that "Re-run failed jobs" repeats it.
+      - name: Require a version newer than every published version
+        timeout-minutes: 5
+        shell: python3 {0}
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+          REGISTRY_URL: https://ghcr.io
+        run: |
+          import http.client
+          import json
+          import os
+          import re
+          import sys
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from typing import NoReturn
+
+          MAX_PAGES = 50
+          PATTERN = re.compile(r"^([0-9]{8})\.([1-9][0-9]*)$")
+
+
+          def fail(message: str) -> NoReturn:
+              sys.exit(f"Version check failed: {message}")
+
+
+          class RejectRedirects(urllib.request.HTTPRedirectHandler):
+              # Never follow a redirect: the Bearer token must not leave the
+              # registry, and tags served by another location are not trusted.
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  fail(f"GET {req.full_url} was redirected (HTTP {code}) to {newurl}")
+
+
+          OPENER = urllib.request.build_opener(RejectRedirects)
+
+
+          def fetch(url: str, headers: dict[str, str]) -> tuple[bytes, list[str]]:
+              for attempt in range(1, 6):
+                  try:
+                      request = urllib.request.Request(url, headers=headers)
+                      with OPENER.open(request, timeout=30) as response:
+                          return response.read(), response.headers.get_all("Link") or []
+                  except urllib.error.HTTPError as error:
+                      retryable = error.code == 429 or error.code >= 500
+                      if not retryable or attempt == 5:
+                          fail(f"GET {url} returned HTTP {error.code}")
+                  except (
+                      urllib.error.URLError,
+                      TimeoutError,
+                      ConnectionError,
+                      http.client.HTTPException,
+                  ) as error:
+                      if attempt == 5:
+                          fail(f"GET {url} failed: {error}")
+                  time.sleep(2 * attempt)
+              raise AssertionError("unreachable")
+
+
+          def key(version: str) -> tuple[int, int]:
+              match = PATTERN.match(version)
+              if match is None:
+                  fail(f"{version!r} is not a YYYYMMDD.N version")
+              return int(match.group(1)), int(match.group(2))
+
+
+          candidate = os.environ["VERSION"]
+          registry = os.environ["REGISTRY_URL"].rstrip("/")
+          image = os.environ["IMAGE_NAME"]
+          if not image.startswith("ghcr.io/"):
+              fail(f"unexpected image name {image!r}")
+          repository = image.removeprefix("ghcr.io/")
+          key(candidate)
+
+          body, _ = fetch(
+              f"{registry}/token?service=ghcr.io&scope=repository:{repository}:pull", {}
+          )
+          try:
+              token = json.loads(body)["token"]
+          except (ValueError, KeyError, TypeError):
+              fail("registry token response has no token")
+          if not isinstance(token, str) or not token:
+              fail("registry token is empty")
+
+          tags_root = f"{registry}/v2/{repository}/tags/list"
+          next_url: str | None = f"{tags_root}?n=1000"
+          visited: set[str] = set()
+          tags: list[str] = []
+          while next_url is not None:
+              if next_url in visited:
+                  fail(f"pagination loops back to {next_url}")
+              if len(visited) >= MAX_PAGES:
+                  fail(f"more than {MAX_PAGES} tag pages")
+              visited.add(next_url)
+              body, links = fetch(next_url, {"Authorization": f"Bearer {token}"})
+              try:
+                  page = json.loads(body)
+              except ValueError:
+                  fail(f"tag page {next_url} is not JSON")
+              page_tags = page.get("tags") if isinstance(page, dict) else None
+              if not isinstance(page_tags, list) or not all(
+                  isinstance(tag, str) for tag in page_tags
+              ):
+                  fail(f"tag page {next_url} has no list of tags")
+              tags.extend(page_tags)
+              current, next_url = next_url, None
+              for link in links:
+                  match = re.search(r'<([^>]+)>\s*;\s*rel="?next"?', link)
+                  if match:
+                      next_url = urllib.parse.urljoin(current, match.group(1))
+                      if not next_url.startswith(f"{tags_root}?"):
+                          fail(f"unexpected pagination link {next_url}")
+
+          published = [tag for tag in tags if PATTERN.match(tag)]
+          if not published:
+              fail("no published version tags found in the registry")
+          newest = max(published, key=key)
+          if key(candidate) <= key(newest):
+              fail(f"VERSION {candidate} is not newer than published version {newest}")
+          print(
+              f"VERSION {candidate} is newer than published version {newest} "
+              f"({len(tags)} tags, {len(visited)} pages)"
+          )
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
@@ -98,15 +324,14 @@ jobs:
           docker run -d --name ghidra-mcp-ci --network host \
             -e GHIDRA_MCP_PUBLIC_URL=http://127.0.0.1:8765 \
             -e GHIDRA_MCP_AUTH_TOKEN="$TOKEN" \
-            -v "${GITHUB_WORKSPACE}/.ci-fixtures:/data/input:ro" \
             "${IMAGE_NAME}@${{ steps.image.outputs.digest }}"
           HEALTH=""
-          for attempt in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             HEALTH="$(curl -fsS http://127.0.0.1:8765/health || true)"
             if [ -n "$HEALTH" ]; then
               python3 -c 'import json,sys; data=json.loads(sys.argv[4]); assert data == {"status": "ok", "version": sys.argv[1], "git_commit": sys.argv[2], "schema_version": sys.argv[3]}' \
                 "${{ steps.version.outputs.value }}" "${{ github.sha }}" \
-                "${{ steps.source.outputs.schema }}" "$HEALTH"
+                "${{ steps.version.outputs.schema }}" "$HEALTH"
               break
             fi
             sleep 2
@@ -115,9 +340,6 @@ jobs:
             docker logs ghidra-mcp-ci
             exit 1
           fi
-          GHIDRA_MCP_CONTAINER_URL=http://127.0.0.1:8765/mcp \
-            GHIDRA_MCP_CONTAINER_TOKEN="$TOKEN" \
-            .ci-venv/bin/uv run pytest tests/integration/test_container_mcp.py
 
       - name: Promote verified digest
         shell: bash

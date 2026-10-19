@@ -213,6 +213,8 @@ def create_mcp_app(
             issuer_url=base_url,
             resource_server_url=f"{base_url}/mcp",
             required_scopes=["mcp"],
+            # 静态 Bearer token 不携带 RFC 8707 resource/audience，由 StaticTokenVerifier 自行比对。
+            validate_token_resource=False,
         )
         verifier = StaticTokenVerifier(auth_token)
     app = FastMCP(

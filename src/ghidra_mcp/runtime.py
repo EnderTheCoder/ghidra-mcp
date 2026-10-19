@@ -19,7 +19,18 @@ class WorkspaceError(RuntimeError):
     """程序工作区操作失败。"""
 
 
-_MINIMUM_GHIDRA_VERSION = (12, 1, 2)
+# 最低支持版本。12.1.3 修复了导入 XML `*.bytes` 文件时的路径穿越漏洞（GP-7064），
+# 以及 12.1.2 引入的 ELF 导入回归（处理动态 GNU 哈希表和符号表时可能失败，GP-7061）。
+# 本服务会导入不可信二进制，因此在启动 JVM 之前拒绝更低的版本。
+_MINIMUM_GHIDRA_VERSION = (12, 1, 3)
+_MINIMUM_GHIDRA_VERSION_REASON = (
+    "12.1.3 修复了导入 XML *.bytes 文件时的路径穿越漏洞（GP-7064），"
+    "以及 12.1.2 引入的 ELF 导入回归（处理动态 GNU 哈希表和符号表时可能失败，GP-7061）"
+)
+
+
+def _format_version(version: tuple[int, int, int]) -> str:
+    return ".".join(str(part) for part in version)
 
 
 def _read_ghidra_version(install_dir: Path) -> tuple[int, int, int]:
@@ -71,8 +82,13 @@ class GhidraRuntime:
                     raise WorkspaceError(f"Ghidra 安装目录不存在：{self.install_dir}")
                 version = _read_ghidra_version(self.install_dir)
                 if version < _MINIMUM_GHIDRA_VERSION:
-                    detected = ".".join(str(part) for part in version)
-                    raise WorkspaceError(f"Ghidra {detected} 低于安全最低版本 12.1.2")
+                    minimum = _format_version(_MINIMUM_GHIDRA_VERSION)
+                    raise WorkspaceError(
+                        f"Ghidra {_format_version(version)}（{self.install_dir}）"
+                        f"低于最低支持版本 {minimum}：{_MINIMUM_GHIDRA_VERSION_REASON}。"
+                        f"请安装 Ghidra {minimum} 或更高版本，"
+                        "并将 GHIDRA_INSTALL_DIR 指向新的安装目录"
+                    )
                 self._launcher = self.pyghidra.start(install_dir=self.install_dir)
             return self._launcher
 

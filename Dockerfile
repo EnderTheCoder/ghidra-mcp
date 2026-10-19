@@ -3,8 +3,8 @@ FROM ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebff
 ENV DEBIAN_FRONTEND=noninteractive \
     TZ=UTC
 
-ARG GHIDRA_URL=https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.1.2_build/ghidra_12.1.2_PUBLIC_20260605.zip
-ARG GHIDRA_SHA256=b62e81a0390618466c019c60d8c2f796ced2509c4c1aea4a37644a77272cf99d
+ARG GHIDRA_URL=https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.1.4_build/ghidra_12.1.4_PUBLIC_20260921.zip
+ARG GHIDRA_SHA256=ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl unzip \
@@ -28,8 +28,9 @@ RUN apt-get update \
     && python3 -m venv /opt/build-venv
 ENV PATH=/opt/build-venv/bin:$PATH
 COPY pyproject.toml uv.lock README.md VERSION LICENSE NOTICE ./
+COPY tools/uv-requirements.txt ./tools/uv-requirements.txt
 COPY src ./src
-RUN pip install --no-cache-dir --retries 5 --timeout 60 uv==0.8.0 \
+RUN pip install --no-cache-dir --retries 5 --timeout 60 --require-hashes -r tools/uv-requirements.txt \
     && uv export --locked --no-dev --no-emit-project --output-file requirements.txt \
     && uv build --wheel --out-dir /dist \
     && pip wheel --no-cache-dir --retries 5 --timeout 60 --wheel-dir /wheels -r requirements.txt
@@ -49,8 +50,18 @@ ENV DEBIAN_FRONTEND=noninteractive \
     GHIDRA_MCP_INPUT_ROOT=/data/input \
     PATH=/opt/venv/bin:$PATH
 
+# Runtime apt pins: only the packages the server actually executes are pinned,
+# to exact versions resolved from noble-updates/noble-security for the base image
+# digest above. python3.12 pins python3.12-minimal and libpython3.12-stdlib through
+# its exact (=) dependencies; python3 and python3-venv are unversioned metapackages
+# that provide the python3 command and accept the pinned interpreter. Other runtime
+# libraries (for example OpenJDK's dependencies) are not pinned. The build stages
+# are not pinned because their downloads are verified separately (Ghidra by
+# sha256, Python wheels by the hashes in uv.lock). Ubuntu only indexes the newest
+# version per pocket, so a pin stops resolving when Ubuntu ships an update; the
+# scheduled .github/workflows/apt-pin-check.yml run turns red when that happens.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates openjdk-21-jre-headless python3 python3-venv \
+    && apt-get install -y --no-install-recommends ca-certificates openjdk-21-jre-headless=21.0.12.1+1-1~24.04.4 python3 python3-venv python3.12=3.12.3-1ubuntu0.17 python3.12-venv=3.12.3-1ubuntu0.17 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 ghidra-mcp \
     && useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin ghidra-mcp \
