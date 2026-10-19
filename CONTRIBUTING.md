@@ -6,7 +6,7 @@ By intentionally submitting a pull request, you confirm that you have the right 
 
 ## Set up the development environment
 
-Requirements are Python 3.11–3.13, `uv`, Zig for generating ELF fixtures, and Ghidra 12.1.2+ for integration tests.
+Requirements are Python 3.11–3.13, `uv`, Zig for generating ELF fixtures, and Ghidra 12.1.3+ for integration tests.
 
 ```bash
 uv sync --locked --extra dev

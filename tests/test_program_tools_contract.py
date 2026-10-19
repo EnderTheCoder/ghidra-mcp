@@ -59,7 +59,7 @@ class FakePyGhidra:
 def write_ghidra_version(install_dir: Path) -> None:
     properties = install_dir / "Ghidra" / "application.properties"
     properties.parent.mkdir(parents=True)
-    properties.write_text("application.version=12.1.2\n", encoding="utf-8")
+    properties.write_text("application.version=12.1.4\n", encoding="utf-8")
 
 
 def test_program_tools_cover_open_list_info_and_close(tmp_path: Path) -> None:

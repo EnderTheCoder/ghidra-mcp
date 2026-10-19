@@ -19,7 +19,7 @@ DESCRIPTION = """回显输入文本。
 """
 
 
-def write_ghidra_version(install_dir: Path, version: str = "12.1.2") -> None:
+def write_ghidra_version(install_dir: Path, version: str = "12.1.4") -> None:
     properties = install_dir / "Ghidra" / "application.properties"
     properties.parent.mkdir(parents=True, exist_ok=True)
     properties.write_text(f"application.version={version}\n", encoding="utf-8")
@@ -402,9 +402,21 @@ def test_runtime_deadline_includes_monitor_construction_time(
         runtime.analyze(object())
 
 
-@pytest.mark.parametrize("version", ["12.0.4", "12.1.0", "12.1.1"])
+@pytest.mark.parametrize(
+    ("version", "detected"),
+    [
+        ("12.0.4", "12.0.4"),
+        ("12.1", "12.1.0"),
+        ("12.1.0", "12.1.0"),
+        ("12.1.1", "12.1.1"),
+        ("12.1.2", "12.1.2"),
+        ("12.1.2-DEV", "12.1.2"),
+        (" 12.1.2 ", "12.1.2"),
+        ("11.99.99", "11.99.99"),
+    ],
+)
 def test_runtime_rejects_ghidra_versions_with_known_reachable_vulnerabilities(
-    tmp_path: Path, version: str
+    tmp_path: Path, version: str, detected: str
 ) -> None:
     from ghidra_mcp.runtime import GhidraRuntime, WorkspaceError
 
@@ -412,10 +424,64 @@ def test_runtime_rejects_ghidra_versions_with_known_reachable_vulnerabilities(
     write_ghidra_version(install_dir, version)
     fake = FakePyGhidra()
 
-    with pytest.raises(WorkspaceError, match=r"12\.1\.2"):
+    with pytest.raises(WorkspaceError) as raised:
+        GhidraRuntime(install_dir, pyghidra_module=fake).ensure_started()
+
+    message = str(raised.value)
+    assert f"Ghidra {detected}（" in message
+    assert str(install_dir.resolve()) in message
+    assert "最低支持版本 12.1.3" in message
+    assert "路径穿越" in message and "GP-7064" in message
+    assert "ELF 导入回归" in message and "GP-7061" in message
+    assert "GHIDRA_INSTALL_DIR" in message
+    assert fake.start_calls == []
+
+
+@pytest.mark.parametrize("version", ["12.1.3", "12.1.4", "12.1.10", "12.1.4-DEV", "13.0"])
+def test_runtime_accepts_ghidra_versions_at_or_above_the_minimum(
+    tmp_path: Path, version: str
+) -> None:
+    from ghidra_mcp.runtime import GhidraRuntime
+
+    install_dir = tmp_path / "ghidra"
+    write_ghidra_version(install_dir, version)
+    fake = FakePyGhidra()
+
+    GhidraRuntime(install_dir, pyghidra_module=fake).ensure_started()
+
+    assert fake.start_calls == [install_dir]
+
+
+@pytest.mark.parametrize("version", ["", "12", "12.x.4", "v12.1.4", "12..4"])
+def test_runtime_rejects_unparseable_ghidra_versions(tmp_path: Path, version: str) -> None:
+    from ghidra_mcp.runtime import GhidraRuntime, WorkspaceError
+
+    install_dir = tmp_path / "ghidra"
+    write_ghidra_version(install_dir, version)
+    fake = FakePyGhidra()
+
+    with pytest.raises(WorkspaceError, match="无法确认 Ghidra 版本"):
         GhidraRuntime(install_dir, pyghidra_module=fake).ensure_started()
 
     assert fake.start_calls == []
+
+
+def test_dockerfile_bundles_an_official_ghidra_release_at_or_above_the_minimum() -> None:
+    import re
+
+    from ghidra_mcp.runtime import _MINIMUM_GHIDRA_VERSION
+
+    dockerfile = (Path(__file__).parents[1] / "Dockerfile").read_text(encoding="utf-8")
+    url = re.search(r"^ARG GHIDRA_URL=(\S+)$", dockerfile, re.MULTILINE)
+    digest = re.search(r"^ARG GHIDRA_SHA256=([0-9a-f]{64})$", dockerfile, re.MULTILINE)
+    assert url is not None and digest is not None
+    match = re.fullmatch(
+        r"https://github\.com/NationalSecurityAgency/ghidra/releases/download/"
+        r"Ghidra_(\d+)\.(\d+)\.(\d+)_build/ghidra_\1\.\2\.\3_PUBLIC_\d{8}\.zip",
+        url.group(1),
+    )
+    assert match is not None, url.group(1)
+    assert tuple(int(part) for part in match.groups()) >= _MINIMUM_GHIDRA_VERSION
 
 
 def test_runtime_accepts_future_two_component_ghidra_version(tmp_path: Path) -> None:

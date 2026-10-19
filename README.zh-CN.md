@@ -4,7 +4,7 @@
 
 面向 headless 逆向分析的单进程 MCP 服务。Python 进程通过 PyGhidra 启动 JVM、管理持久化 Ghidra 项目，并向 AI 客户端暴露 35 个任务导向工具。
 
-> 安全支持基线是 Ghidra 12.1.2+。Streamable HTTP 必须配置 Bearer token；跨主机部署还必须在可信反向代理终止 TLS。
+> 安全支持基线是 Ghidra 12.1.3+，更低版本会在启动 JVM 前被拒绝。容器镜像内置 Ghidra 12.1.4。Streamable HTTP 必须配置 Bearer token；跨主机部署还必须在可信反向代理终止 TLS。
 
 ## 项目状态
 
@@ -60,7 +60,7 @@ docker buildx build \
 
 ## 本地 stdio
 
-前置条件：Python 3.11–3.13、Ghidra 12.1.2+、`uv` 和可写的项目目录。
+前置条件：Python 3.11–3.13、Ghidra 12.1.3+、`uv` 和可写的项目目录。
 
 ```bash
 uv sync --locked
