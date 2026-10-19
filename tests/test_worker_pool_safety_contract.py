@@ -420,6 +420,44 @@ def test_cancelled_waiter_leaves_the_queue_and_unblocks_readers_behind_it() -> N
     assert gates.active_keys() == []
 
 
+@pytest.mark.parametrize("resumed_before_cancel", [False, True])
+@pytest.mark.parametrize("exclusive", [True, False])
+def test_waiter_cancelled_after_being_granted_hands_the_gate_back(
+    exclusive: bool, resumed_before_cancel: bool
+) -> None:
+    """闸门已经交给等待者、它还没恢复执行就被取消：必须原样交还，否则该程序永久卡住。
+
+    resumed_before_cancel=False：取消发生在唤醒回调 _resolve 运行之前；
+    resumed_before_cancel=True：_resolve 已运行（future 已完成），但任务还没恢复执行。
+    """
+
+    from ghidra_mcp.concurrency import ProgramGates
+
+    gates = ProgramGates()
+
+    async def exercise() -> None:
+        await gates.acquire("p", exclusive=True)
+        granted = asyncio.create_task(gates.acquire("p", exclusive=exclusive))
+        await asyncio.sleep(0)
+        behind = asyncio.create_task(gates.acquire("p", exclusive=True))
+        await asyncio.sleep(0)
+        # 释放时闸门直接交给排在队首的等待者；排在它后面的写者仍在队列里。
+        gates.release("p", exclusive=True)
+        assert len(gates._gates["p"].waiters) == 1
+        if resumed_before_cancel:
+            await asyncio.sleep(0)
+        assert not granted.done()
+        granted.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await granted
+        # 被取消的等待者交还了闸门，后面的写者因此进入。
+        await asyncio.wait_for(behind, DEADLINE)
+        gates.release("p", exclusive=True)
+
+    asyncio.run(exercise())
+    assert gates.active_keys() == []
+
+
 def test_readers_queued_behind_a_writer_enter_together_after_it() -> None:
     from ghidra_mcp.concurrency import ProgramGates
 
