@@ -1,10 +1,5 @@
 # Changelog
 
-## Unreleased
-
-- Added the `GHIDRA_MCP_MAX_WORKERS` setting (environment, `.env`, or `server.max_workers` in TOML) to run JVM tool calls on a bounded worker pool, from 1 to 64; the default stays 1 to keep single-thread ownership.
-- Read-only tool calls now take a shared per-program gate while mutating calls take an exclusive per-program gate, so concurrent `decompile_function` and other reads on one program run in parallel and Ghidra transactions never overlap. Gates are keyed by the underlying binary so concurrent sessions of one binary also stay serialized.
-
 ## 20260722.6
 
 - Moved detailed user documentation to the GitHub Wiki and made the remaining repository documentation English-first.
